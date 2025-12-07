@@ -90,6 +90,9 @@ async fn start_tcp_server(state: Arc<AppState>, tcp_addr: String) {
             Ok((socket, addr)) => {
                 info!("[TCP] New connection from {}", addr);
                 let state = state.clone();
+                if let Err(e) = socket.set_nodelay(true) {
+                    warn!("[TCP] Failed to set TCP_NODELAY: {}", e);
+                }
                 tokio::spawn(async move {
                     handle_tcp_connection(socket, state).await;
                 });
@@ -132,7 +135,7 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
         error!("[TCP] Failed to send Room ID to client: {}", e);
     }
 
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; 1_048_576];
 
     loop {
         tokio::select! {
@@ -142,7 +145,7 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
                     Ok(n) => {
                         let data = buffer[0..n].to_vec();
                         let stream = serde_json::Deserializer::from_slice(&data).into_iter::<Value>();
-                        
+
                         for json in stream {
                             if let Ok(value) = json {
                                 if let Some(op) = value.get("op").and_then(|v| v.as_u64()) {
@@ -175,6 +178,7 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
                     error!("[TCP] Write error: {}", e);
                     break;
                 }
+                let _ = wr.flush();
             }
         }
     }
@@ -238,7 +242,7 @@ async fn handle_ws_socket(mut socket: WebSocket, room_id: String, state: Arc<App
                             if let Some(op) = json["op"].as_u64() {
                                 if op == 1 { // Identify
                                     info!("[SMART] Intercepted 'Identify' from Web Client. Blocking forwarding.");
-                                    
+
                                     let r = room.obs_identified.read().await;
                                     if let Some(identified_msg) = &*r {
                                         info!("[SMART] Sending cached 'Identified' response");
