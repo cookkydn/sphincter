@@ -124,69 +124,82 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
 
     state.rooms.insert(room_id.clone(), room.clone());
 
-    let (mut rd, mut wr) = socket.split();
-
     let welcome_msg = serde_json::json!({
         "internal": "welcome",
         "room": room_id
     });
+
     let welcome_bytes = welcome_msg.to_string();
-    if let Err(e) = wr.write_all(welcome_bytes.as_bytes()).await {
-        error!("[TCP] Failed to send Room ID to client: {}", e);
+    if let Err(e) = socket.write_all(welcome_bytes.as_bytes()).await {
+        error!("[TCP] Failed to send Room ID: {}", e);
+        return;
     }
 
-    let mut buffer = vec![0u8; 1_048_576];
+    let (mut rd, mut wr) = socket.into_split();
+    
+    let room_reader = room.clone();
+    let broadcast_tx_reader = broadcast_tx.clone();
 
-    loop {
-        tokio::select! {
-            result = rd.read(&mut buffer) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = buffer[0..n].to_vec();
-                        let stream = serde_json::Deserializer::from_slice(&data).into_iter::<Value>();
+    let reader_task = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4]; 
+        
+        loop {
+            match rd.read_exact(&mut len_buf).await {
+                Ok(_) => {
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    
+                    let mut msg_buffer = vec![0u8; len];
 
-                        for json in stream {
-                            if let Ok(value) = json {
-                                if let Some(op) = value.get("op").and_then(|v| v.as_u64()) {
-                                    // Op 0 = Hello
-                                    if op == 0 {
-                                        info!("[SMART] Captured OBS 'Hello' packet");
-                                        let mut w = room.obs_hello.write().await;
-                                        *w = Some(value.to_string());
-                                    }
-                                    // Op 2 = Identified
-                                    else if op == 2 {
-                                        info!("[SMART] Captured OBS 'Identified' packet");
-                                        let mut w = room.obs_identified.write().await;
-                                        *w = Some(value.to_string());
+                    match rd.read_exact(&mut msg_buffer).await {
+                        Ok(_) => {
+                            let stream = serde_json::Deserializer::from_slice(&msg_buffer).into_iter::<Value>();
+                            for json in stream {
+                                if let Ok(value) = json {
+                                    if let Some(op) = value.get("op").and_then(|v| v.as_u64()) {
+                                        if op == 0 {
+                                            let mut w = room_reader.obs_hello.write().await;
+                                            *w = Some(value.to_string());
+                                        } else if op == 2 {
+                                            let mut w = room_reader.obs_identified.write().await;
+                                            *w = Some(value.to_string());
+                                        }
                                     }
                                 }
                             }
+                            let _ = broadcast_tx_reader.send(msg_buffer);
                         }
-                        let _ = broadcast_tx.send(data);
-                    }
-                    Err(e) => {
-                        error!("[TCP] Read error: {}", e);
-                        break;
+                        Err(e) => {
+                            error!("[TCP] Error reading message body: {}", e);
+                            break;
+                        }
                     }
                 }
-            }
-
-            Some(msg) = mpsc_rx.recv() => {
-                if let Err(e) = wr.write_all(&msg).await {
-                    error!("[TCP] Write error: {}", e);
+                Err(_) => {
                     break;
                 }
-                let _ = wr.flush();
             }
         }
+    });
+
+    // --- TÂCHE D'ÉCRITURE (WEB -> OBS) ---
+    let writer_task = tokio::spawn(async move {
+        while let Some(msg) = mpsc_rx.recv().await {
+            if let Err(e) = wr.write_all(&msg).await {
+                error!("[TCP] Write error: {}", e);
+                break;
+            }
+        }
+    });
+
+    // On attend que l'un des deux finisse (si la connexion coupe ou erreur)
+    tokio::select! {
+        _ = reader_task => {},
+        _ = writer_task => {},
     }
 
     state.rooms.remove(&room_id);
     info!("[TCP] Room {} cleaned up.", room_id);
 }
-
 async fn ws_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsParams>,
