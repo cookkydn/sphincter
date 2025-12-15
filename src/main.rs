@@ -11,13 +11,14 @@ use clap::Parser;
 use dashmap::DashMap;
 use rand::{distr::Alphanumeric, Rng};
 use serde_json::Value;
-use std::sync::Arc;
-use tokio::sync::broadcast;
+use std::{sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{mpsc, RwLock},
+    time::interval,
 };
+use tokio::{sync::broadcast, time::timeout};
 use tracing::{error, info, warn};
 
 struct Room {
@@ -90,9 +91,21 @@ async fn start_tcp_server(state: Arc<AppState>, tcp_addr: String) {
             Ok((socket, addr)) => {
                 info!("[TCP] New connection from {}", addr);
                 let state = state.clone();
+
                 if let Err(e) = socket.set_nodelay(true) {
                     warn!("[TCP] Failed to set TCP_NODELAY: {}", e);
                 }
+
+                let sock_ref = socket2::SockRef::from(&socket);
+
+                let ka = socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(20))
+                    .with_interval(Duration::from_secs(10));
+
+                if let Err(e) = sock_ref.set_tcp_keepalive(&ka) {
+                    warn!("[TCP] Failed to set keepalive: {}", e);
+                }
+
                 tokio::spawn(async move {
                     handle_tcp_connection(socket, state).await;
                 });
@@ -103,14 +116,43 @@ async fn start_tcp_server(state: Arc<AppState>, tcp_addr: String) {
 }
 
 async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
-    let room_id: String = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(6)
-        .map(char::from)
-        .collect::<String>()
-        .to_uppercase();
+    let mut room_id = String::new();
+    let mut len_buf = [0u8; 4];
+    let handshake_result =
+        timeout(Duration::from_millis(500), socket.read_exact(&mut len_buf)).await;
 
-    info!("[TCP] Room created: {} ", room_id);
+    match handshake_result {
+        Ok(Ok(_)) => {
+            // Le client a envoyé quelque chose, on lit le payload
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut buf = vec![0u8; len];
+
+            if socket.read_exact(&mut buf).await.is_ok() {
+                // On essaie de parser pour voir si c'est une demande de room
+                if let Ok(json) = serde_json::from_slice::<Value>(&buf) {
+                    if let Some(req) = json.get("request_room").and_then(|v| v.as_str()) {
+                        room_id = req.to_uppercase();
+                        info!("[TCP] Client requested room resumption: {}", room_id);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Timeout (le client attend le Welcome) ou erreur : on génère un ID aléatoire
+            // Note: Si le client a envoyé des données partielles, elles sont perdues ici,
+            // mais pour un handshake c'est acceptable.
+        }
+    }
+
+    if room_id.is_empty() {
+        room_id = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(6)
+            .map(char::from)
+            .collect::<String>()
+            .to_uppercase();
+        info!("[TCP] Room created (Random): {} ", room_id);
+    }
 
     let (broadcast_tx, _) = broadcast::channel(100);
     let (mpsc_tx, mut mpsc_rx) = mpsc::channel(100);
@@ -122,6 +164,7 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
         obs_identified: Arc::new(RwLock::new(None)),
     });
 
+    // Écrasement (reconnexion) ou insertion
     state.rooms.insert(room_id.clone(), room.clone());
 
     let welcome_msg = serde_json::json!({
@@ -136,23 +179,24 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
     }
 
     let (mut rd, mut wr) = socket.into_split();
-    
+
     let room_reader = room.clone();
     let broadcast_tx_reader = broadcast_tx.clone();
 
     let reader_task = tokio::spawn(async move {
-        let mut len_buf = [0u8; 4]; 
-        
+        let mut len_buf = [0u8; 4];
+
         loop {
             match rd.read_exact(&mut len_buf).await {
                 Ok(_) => {
                     let len = u32::from_be_bytes(len_buf) as usize;
-                    
+
                     let mut msg_buffer = vec![0u8; len];
 
                     match rd.read_exact(&mut msg_buffer).await {
                         Ok(_) => {
-                            let stream = serde_json::Deserializer::from_slice(&msg_buffer).into_iter::<Value>();
+                            let stream = serde_json::Deserializer::from_slice(&msg_buffer)
+                                .into_iter::<Value>();
                             for json in stream {
                                 if let Ok(value) = json {
                                     if let Some(op) = value.get("op").and_then(|v| v.as_u64()) {
@@ -197,8 +241,18 @@ async fn handle_tcp_connection(mut socket: TcpStream, state: Arc<AppState>) {
         _ = writer_task => {},
     }
 
-    state.rooms.remove(&room_id);
-    info!("[TCP] Room {} cleaned up.", room_id);
+    if let Some(r) = state.rooms.get(&room_id) {
+        if Arc::ptr_eq(&r, &room) {
+            drop(r); // Release lock
+            state.rooms.remove(&room_id);
+            info!("[TCP] Room {} cleaned up.", room_id);
+        } else {
+            info!(
+                "[TCP] Room {} disconnected but session was resumed by another socket.",
+                room_id
+            );
+        }
+    }
 }
 async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -236,7 +290,8 @@ async fn handle_ws_socket(mut socket: WebSocket, room_id: String, state: Arc<App
     }
     // On récupère les canaux
     let mut broadcast_rx = room.broadcast_tx.subscribe();
-
+    let mut heartbeat = interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             Ok(msg) = broadcast_rx.recv() => {
@@ -280,7 +335,13 @@ async fn handle_ws_socket(mut socket: WebSocket, room_id: String, state: Arc<App
                     _ => {}
                 }
             }
-
+            _ = heartbeat.tick() => {
+                // Envoie un message de contrôle PING vide
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    warn!("[WEB] Failed to send heartbeat to room {}. Client might be gone.", room_id);
+                    break;
+                }
+            }
             else => break,
         }
     }
